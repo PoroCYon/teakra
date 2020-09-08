@@ -342,7 +342,7 @@ public:
                             converter >> std::hex >> addr;
                             breakpoints.push_back(addr);
                         } else if (cmd_d[0] == "d" && cmd_d.size() > 0) {
-                            if (std::stoi(cmd_d[1]) < breakpoints.size())
+                            if (std::stoi(cmd_d[1]) < (int)breakpoints.size())
                                 breakpoints.erase(breakpoints.begin() + std::stoi(cmd_d[1]));
                         } else if (cmd_d[0] == "pr") {
                             print_registers();
