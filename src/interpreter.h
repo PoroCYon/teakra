@@ -1,10 +1,16 @@
 #pragma once
 #include <atomic>
+#include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <iterator>
+#include <sstream>
 #include <stdexcept>
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <teakra/disassembler.h>
 #include "bit.h"
 #include "core_timing.h"
 #include "crash.h"
@@ -22,9 +28,26 @@ public:
 
 class Interpreter {
 public:
-    Interpreter(CoreTiming& core_timing, RegisterState& regs, MemoryInterface& mem)
-        : core_timing(core_timing), regs(regs), mem(mem) {}
+    std::ofstream trace_file;
 
+    FILE* dbg_in;
+    FILE* dbg_out;
+    u64 cycles_left = 0;
+    bool break_it = true;
+    char cmd_in[1024];
+    char cmd_out[1024];
+    std::vector<u32> breakpoints;
+    Interpreter(CoreTiming& core_timing, RegisterState& regs, MemoryInterface& mem)
+        : core_timing(core_timing), regs(regs), mem(mem) {
+        trace_file.open("/dev/null");
+        dbg_in = fopen("/tmp/ramfs/teak_in", "r");
+        dbg_out = fopen("/tmp/ramfs/teak_out", "w");
+    }
+    ~Interpreter() {
+        fclose(dbg_out);
+        fclose(dbg_in);
+        trace_file.close();
+    }
     void PushPC() {
         u16 l = (u16)(regs.pc & 0xFFFF);
         u16 h = (u16)(regs.pc >> 16);
@@ -58,16 +81,295 @@ public:
         UNREACHABLE();
     }
 
+private:
+    void print_registers() {
+        fprintf(dbg_out, "Registers:\n");
+        fprintf(dbg_out, "a0:  0x%010lx    b0:  0x%010lx\n", regs.a[0] & 0xFFFFFFFFFF,
+                regs.b[0] & 0xFFFFFFFFFF);
+        fprintf(dbg_out, "a1:  0x%010lx    b1:  0x%010lx\n", regs.a[1] & 0xFFFFFFFFFF,
+                regs.b[1] & 0xFFFFFFFFFF);
+        // fprintf(dbg_out, "a1s: 0x%010lx    b1s: 0x%010lx\n", regs.a1s, regs.b1s);
+        fprintf(dbg_out, "x0:  0x%04x          y0:  0x%04x\n", regs.x[0], regs.y[0]);
+        fprintf(dbg_out, "x1:  0x%04x          y1:  0x%04x\n", regs.x[1], regs.y[1]);
+        fprintf(dbg_out, "p0:  0x%08x      p1:  0x%08x    p0h_cbs: 0x%04x\n", regs.p[0], regs.p[1],
+                regs.p0h_cbs);
+        fprintf(dbg_out, "r0:  0x%04x          r1:  0x%04x        r2:  0x%04x     r3:  0x%04x\n",
+                regs.r[0], regs.r[1], regs.r[2], regs.r[3]);
+        fprintf(dbg_out, "r4:  0x%04x          r5:  0x%04x        r6:  0x%04x     r7:  0x%04x\n",
+                regs.r[4], regs.r[5], regs.r[6], regs.r[7]);
+        // fprintf(dbg_out, "r0b: 0x%04x          r1b: 0x%04x        r4b: 0x%04x     r7b: 0x%04x\n",
+        // regs.r0b, regs.r1b, regs.r4b, regs.r7b);
+        fprintf(dbg_out, "bkrep0: start: 0x%08x    end: 0x%08x    lc: 0x%04x\n",
+                regs.bkrep_stack[0].start, regs.bkrep_stack[0].end, regs.bkrep_stack[0].lc);
+        fprintf(dbg_out, "bkrep1: start: 0x%08x    end: 0x%08x    lc: 0x%04x\n",
+                regs.bkrep_stack[1].start, regs.bkrep_stack[1].end, regs.bkrep_stack[1].lc);
+        fprintf(dbg_out, "bkrep2: start: 0x%08x    end: 0x%08x    lc: 0x%04x\n",
+                regs.bkrep_stack[2].start, regs.bkrep_stack[2].end, regs.bkrep_stack[2].lc);
+        fprintf(dbg_out, "bkrep3: start: 0x%08x    end: 0x%08x    lc: 0x%04x\n",
+                regs.bkrep_stack[3].start, regs.bkrep_stack[3].end, regs.bkrep_stack[3].lc);
+        // fprintf(dbg_out, "vtr0: 0x%04x        vtr1: 0x%04x    repcs: %u\n", regs.vtr0, regs.vtr1,
+        // regs.repcs);
+        fprintf(dbg_out, "vtr0: 0x%04x        vtr1: 0x%04x       page: 0x%04x\n", regs.vtr0,
+                regs.vtr1, regs.page);
+        fprintf(dbg_out, "ext0: 0x%04x        ext1: 0x%04x       ext2: 0x%04x    ext3: 0x%04x\n",
+                regs.ext[0], regs.ext[1], regs.ext[2], regs.ext[3]);
+        fprintf(dbg_out, " pc: 0x%05x        mixp: 0x%04x         sp: 0x%04x      sv: 0x%04x\n",
+                regs.pc, regs.mixp, regs.sp, regs.sv);
+    }
+
+    void print_pseudo_registers_short() {
+        fprintf(dbg_out, "Pseudo-Registers:\n");
+        fprintf(dbg_out, "cfgi: 0x%04x                           cfgj: 0x%04x\n", regs.Get<cfgi>(),
+                regs.Get<cfgj>());
+        fprintf(dbg_out,
+                " modi: 0x%03x stepi: 0x%02x stepi0: 0x%02x   modj: 0x%03x stepj: 0x%02x stepj0: "
+                "0x%02x\n",
+                regs.modi, regs.stepi, regs.stepi0, regs.modj, regs.stepj, regs.stepj0);
+        // fprintf(dbg_out, " modib: 0x%03x stepib: 0x%02x                 modjb: 0x%03x stepjb:
+        // 0x%02x\n", regs.modib, regs.stepib, regs.modjb, regs.stepjb); fprintf(dbg_out, " stepi0:
+        // 0x%02x stepi0b: 0x%02x                 stepj0: 0x%02x stepj0b: 0x%02x\n", regs.stepi0,
+        // regs.stepi0b, regs.stepj0, regs.stepj0b);
+
+        fprintf(dbg_out, "stt0: 0x%04x        stt1: 0x%04x       stt2: 0x%04x\n", regs.Get<stt0>(),
+                regs.Get<stt1>(), regs.Get<stt2>());
+
+        fprintf(dbg_out, "mod0: 0x%04x        mod1: 0x%04x       mod2: 0x%04x     mod3: 0x%04x\n",
+                regs.Get<mod0>(), regs.Get<mod1>(), regs.Get<mod2>(), regs.Get<mod3>());
+        fprintf(dbg_out, " st0: 0x%04x         st1: 0x%04x        st2: 0x%04x\n", regs.Get<st0>(),
+                regs.Get<st1>(), regs.Get<st2>());
+
+        fprintf(dbg_out, " icr: 0x%04x         ar0: 0x%04x        ar1: 0x%04x\n", regs.Get<icr>(),
+                regs.Get<ar0>(), regs.Get<ar1>());
+
+        fprintf(dbg_out, "arp0: 0x%04x        arp1: 0x%04x       arp2: 0x%04x     arp3: 0x%04x\n",
+                regs.Get<arp0>(), regs.Get<arp1>(), regs.Get<arp2>(), regs.Get<arp3>());
+    }
+
+    void print_pseudo_registers_long() {
+        fprintf(dbg_out, "Pseudo-Registers:\n");
+        fprintf(dbg_out, "cfgi: 0x%04x                            cfgj: 0x%04x\n", regs.Get<cfgi>(),
+                regs.Get<cfgj>());
+        fprintf(dbg_out,
+                " modi: 0x%03x stepi: 0x%02x stepi0: 0x%02x    modj: 0x%03x stepj: 0x%02x stepj0: "
+                "0x%02x\n",
+                regs.modi, regs.stepi, regs.stepi0, regs.modj, regs.stepj, regs.stepj0);
+        // fprintf(dbg_out, " modib: 0x%03x stepib: 0x%02x                 modjb: 0x%03x stepjb:
+        // 0x%02x\n", regs.modib, regs.stepib, regs.modjb, regs.stepjb); fprintf(dbg_out, " stepi0:
+        // 0x%02x stepi0b: 0x%02x                 stepj0: 0x%02x stepj0b: 0x%02x\n", regs.stepi0,
+        // regs.stepi0b, regs.stepj0, regs.stepj0b);
+
+        fprintf(dbg_out, "stt0: 0x%04x\n", regs.Get<stt0>());
+        fprintf(dbg_out, " . . . . fc1 . . . fz fm fn fv fc0 fe fvl flm\n");
+        fprintf(dbg_out, " x x x x   %u x x x  %u  %u  %u  %u   %u  %u   %u   %u\n", regs.fc1,
+                regs.fz, regs.fm, regs.fn, regs.fv, regs.fc0, regs.fe, regs.fvl, regs.flm);
+        fprintf(dbg_out, "stt1: 0x%04x\n", regs.Get<stt1>());
+        fprintf(dbg_out, " pe1 pe0 . . iu1 iu0 . . . . . fr . . . .\n");
+        fprintf(dbg_out, "   %u   %u x x   %u   %u x x x x x  %u x x x x\n", regs.pe[1], regs.pe[0],
+                regs.iu[1], regs.iu[0], regs.fr);
+        fprintf(dbg_out, "stt2: 0x%04x\n", regs.Get<stt2>());
+        fprintf(dbg_out, " lp bcn . . . . pcmhi . . ipv ip2 ip1 ip0\n");
+        fprintf(dbg_out, "  %u --%u x x x x    -%u x x   %u   %u   %u   %u\n", regs.lp, regs.bcn,
+                regs.pcmhi, regs.ipv, regs.ip[2], regs.ip[1], regs.ip[0]);
+
+        fprintf(dbg_out, "mod0: 0x%04x\n", regs.Get<mod0>());
+        fprintf(dbg_out, " . . ps1 . ps0 ou1 ou0 s hwm unk sata sat\n");
+        fprintf(dbg_out, " x x  -%u x  -%u   %u   %u %u  -%u --%u    %u   %u\n", regs.ps[1],
+                regs.ps[0], regs.ou[1], regs.ou[0], regs.s, regs.hwm, regs.mod0_unk_const,
+                regs.sata, regs.sat);
+        fprintf(dbg_out, "mod1: 0x%04x\n", regs.Get<mod1>());
+        fprintf(dbg_out, " epj epi cmd stp16 . . . . page\n");
+        fprintf(dbg_out, "   %u   %u   %u     %u x x x x 0x%02x\n", regs.epj, regs.epi, regs.cmd,
+                regs.stp16, regs.page);
+        fprintf(dbg_out, "mod2: 0x%04x\n", regs.Get<mod2>());
+        fprintf(dbg_out, " br7 br6 br5 br4 br3 br2 br1 br0 m7 m6 m5 m4 m3 m2 m1 m0\n");
+        fprintf(dbg_out,
+                "   %u   %u   %u   %u   %u   %u   %u   %u  %u  %u  %u  %u  %u  %u  %u  %u\n",
+                regs.br[7], regs.br[6], regs.br[5], regs.br[4], regs.br[3], regs.br[2], regs.br[1],
+                regs.br[0], regs.m[7], regs.m[6], regs.m[5], regs.m[4], regs.m[3], regs.m[2],
+                regs.m[1], regs.m[0]);
+        fprintf(dbg_out, "mod3: 0x%04x\n", regs.Get<mod3>());
+        fprintf(dbg_out, " crep cpc ccnta . imv im2 im1 im0 ie ou4 ou3 ou2 ic2 ic1 ic0 nimc\n");
+        fprintf(
+            dbg_out,
+            "    %u   %u     %u x   %u   %u   %u   %u  %u   %u   %u   %u   %u   %u   %u    %u\n",
+            regs.crep, regs.cpc, regs.ccnta, regs.imv, regs.im[2], regs.im[1], regs.im[0], regs.ie,
+            regs.ou[4], regs.ou[3], regs.ou[2], regs.ic[2], regs.ic[1], regs.ic[0], regs.nimc);
+
+        fprintf(dbg_out, "st0: 0x%04x\n", regs.Get<st0>());
+        fprintf(dbg_out, " a0e fz fm fn fv fc0 fe flm|fvl fr im1 im0 ie sat\n");
+        fprintf(dbg_out, " 0x%lx  %u  %u  %u  %u   %u  %u       %u  %u   %u   %u  %u   %u\n",
+                (regs.a[0] >> 32) & 0xF, regs.fz, regs.fm, regs.fn, regs.fv, regs.fc0, regs.fe,
+                regs.flm | regs.fvl, regs.fr, regs.im[1], regs.im[0], regs.ie, regs.sat);
+        fprintf(dbg_out, "st1: 0x%04x\n", regs.Get<st1>());
+        fprintf(dbg_out, " a1e ps0 . . page\n");
+        fprintf(dbg_out, " 0x%lx   %u x x 0x%02x\n", (regs.a[1] >> 32) & 0xF, regs.ps[0],
+                regs.page);
+        fprintf(dbg_out, "st2: 0x%04x\n", regs.Get<st2>());
+        fprintf(dbg_out, " ip1 ip0 ip2 . iu1 iu0 ou1 ou0 s im2 m5 m4 m3 m2 m1 m0\n");
+        fprintf(dbg_out, "   %u   %u   %u x   %u   %u   %u   %u %u   %u  %u  %u  %u  %u  %u  %u\n",
+                regs.ip[1], regs.ip[0], regs.ip[2], regs.iu[1], regs.iu[0], regs.ou[1], regs.ou[0],
+                regs.s, regs.im[2], regs.m[5], regs.m[4], regs.m[3], regs.m[2], regs.m[1],
+                regs.m[0]);
+
+        fprintf(dbg_out, "icr: 0x%04x\n", regs.Get<icr>());
+        fprintf(dbg_out, " . . . . . . . . bcn lp ic2 ic1 ic0 nimc\n");
+        fprintf(dbg_out, " x x x x x x x x --%u  %u   %u   %u   %u    %u\n", regs.bcn, regs.lp,
+                regs.ic[2], regs.ic[1], regs.ic[0], regs.nimc);
+
+        fprintf(dbg_out, "ar0: 0x%04x\n", regs.Get<ar0>());
+        fprintf(dbg_out,
+                " arrn0: %u arrn1: %u aroffset0: %u arstep0: %u aroffset1: %u arstep1: %u\n",
+                regs.arrn[0], regs.arrn[1], regs.aroffset[0], regs.arstep[0], regs.aroffset[1],
+                regs.arstep[1]);
+        fprintf(dbg_out, "ar1: 0x%04x\n", regs.Get<ar1>());
+        fprintf(dbg_out,
+                " arrn2: %u arrn3: %u aroffset2: %u arstep2: %u aroffset3: %u arstep3: %u\n",
+                regs.arrn[2], regs.arrn[3], regs.aroffset[2], regs.arstep[2], regs.aroffset[3],
+                regs.arstep[3]);
+
+        fprintf(dbg_out, "arp0: 0x%04x\n", regs.Get<arp0>());
+        fprintf(dbg_out,
+                " arprnj0: %u arprni0: %u arpoffsetj0: %u arpstepj0: %u arpoffseti0: %u arpstepi0: "
+                "%u\n",
+                regs.arprnj[0], regs.arprni[0], regs.arpoffsetj[0], regs.arpstepj[0],
+                regs.arpoffseti[0], regs.arpstepi[0]);
+        fprintf(dbg_out, "arp1: 0x%04x\n", regs.Get<arp1>());
+        fprintf(dbg_out,
+                " arprnj1: %u arprni1: %u arpoffsetj1: %u arpstepj1: %u arpoffseti1: %u arpstepi1: "
+                "%u\n",
+                regs.arprnj[1], regs.arprni[1], regs.arpoffsetj[1], regs.arpstepj[1],
+                regs.arpoffseti[1], regs.arpstepi[1]);
+        fprintf(dbg_out, "arp2: 0x%04x\n", regs.Get<arp2>());
+        fprintf(dbg_out,
+                " arprnj2: %u arprni2: %u arpoffsetj2: %u arpstepj2: %u arpoffseti2: %u arpstepi2: "
+                "%u\n",
+                regs.arprnj[2], regs.arprni[2], regs.arpoffsetj[2], regs.arpstepj[2],
+                regs.arpoffseti[2], regs.arpstepi[2]);
+        fprintf(dbg_out, "arp3: 0x%04x\n", regs.Get<arp3>());
+        fprintf(dbg_out,
+                " arprnj3: %u arprni3: %u arpoffsetj3: %u arpstepj3: %u arpoffseti3: %u arpstepi3: "
+                "%u\n",
+                regs.arprnj[3], regs.arprni[3], regs.arpoffsetj[3], regs.arpstepj[3],
+                regs.arpoffseti[3], regs.arpstepi[3]);
+    }
+
+    void print_disasm() {
+        uint16_t opcode = mem.ProgramRead(regs.pc);
+        uint16_t expand_value = 0;
+        uint32_t full_op = opcode;
+        if (Teakra::Disassembler::NeedExpansion(opcode)) {
+            expand_value = mem.ProgramRead(regs.pc + 1);
+            full_op <<= 16;
+            full_op |= expand_value;
+        }
+        std::string result = Teakra::Disassembler::Do(opcode, expand_value);
+        fprintf(dbg_out, "Disasm @ [0x%05x]: 0x%04x: `%s`\n", regs.pc, full_op, result.c_str());
+    }
+
+public:
     void Run(u64 cycles) {
         idle = false;
+        trace_file << std::setfill('0') << std::setw(8) << std::right << std::uppercase << std::hex
+             << regs.pc << std::endl;
         for (u64 i = 0; i < cycles; ++i) {
+            bool in_breakpoints = false;
+            if (std::find(breakpoints.begin(), breakpoints.end(), regs.pc) != breakpoints.end()) {
+                in_breakpoints = true;
+            }
+            if ((break_it && cycles_left == 0) || in_breakpoints) {
+                print_registers();
+                print_pseudo_registers_short();
+                print_disasm();
+                fprintf(dbg_out, "\n");
+                while (1) {
+                    fprintf(dbg_out, ":command? ");
+                    fflush(dbg_out);
+                    if (fgets(cmd_in, 1024, dbg_in) != NULL) {
+                        cmd_in[strlen(cmd_in) - 1] = '\0';
+                        fprintf(dbg_out, "%s!\n\n", cmd_in);
+                        fflush(dbg_out);
+                        std::string cmd(cmd_in);
+                        std::istringstream iss(cmd);
+                        std::vector<std::string> cmd_d(std::istream_iterator<std::string>{iss},
+                                                       std::istream_iterator<std::string>());
+                        if (cmd_d.size() < 1) {
+                            break_it = true;
+                            cycles_left = 0;
+                            break;
+                        }
+
+                        if (cmd_d[0] == "s" || cmd_d[0] == "si") {
+                            break_it = true;
+                            if (cmd_d.size() > 1) {
+                                cycles_left = std::stoi(cmd_d[1]);
+                                if (cycles_left >= 1) {
+                                    cycles_left -= 1;
+                                }
+                                break;
+                            } else {
+                                cycles_left = 0;
+                                break;
+                            }
+                        } else if (cmd_d[0] == "c") {
+                            break_it = false;
+                            break;
+                        } else if ((cmd_d[0] == "rd" || cmd_d[0] == "rp") && cmd_d.size() > 1) {
+                            uint32_t addr;
+                            std::istringstream converter(cmd_d[1]);
+                            converter >> std::hex >> addr;
+                            uint16_t val;
+                            if (cmd_d[0] == "rd") {
+                                val = mem.DataRead(addr);
+                            } else {
+                                val = mem.ProgramRead(addr);
+                            }
+                            fprintf(dbg_out, "0x%04x\n", val);
+                        } else if ((cmd_d[0] == "wd" || cmd_d[0] == "wp") && cmd_d.size() > 2) {
+                            uint32_t addr;
+                            std::istringstream converter(cmd_d[1]);
+                            converter >> std::hex >> addr;
+                            uint16_t data;
+                            std::istringstream converter2(cmd_d[2]);
+                            converter2 >> std::hex >> data;
+                            if (cmd_d[0] == "wd") {
+                                mem.DataWrite(addr, data);
+                            } else {
+                                mem.ProgramWrite(addr, data);
+                            }
+                        } else if (cmd_d[0] == "b" && cmd_d.size() > 0) {
+                            uint32_t addr;
+                            std::istringstream converter(cmd_d[1]);
+                            converter >> std::hex >> addr;
+                            breakpoints.push_back(addr);
+                        } else if (cmd_d[0] == "d" && cmd_d.size() > 0) {
+                            if (std::stoi(cmd_d[1]) < breakpoints.size())
+                                breakpoints.erase(breakpoints.begin() + std::stoi(cmd_d[1]));
+                        } else if (cmd_d[0] == "pr") {
+                            print_registers();
+                        } else if (cmd_d[0] == "pp") {
+                            print_pseudo_registers_short();
+                        } else if (cmd_d[0] == "ppl") {
+                            print_pseudo_registers_long();
+                        }
+                    }
+                }
+            }
+
             if (idle) {
                 u64 skipped = core_timing.Skip(cycles - i - 1);
                 i += skipped;
+                if (cycles_left > skipped) {
+                    cycles_left -= skipped;
+                } else {
+                    cycles_left = 0;
+                }
 
                 // Skip additional tick so to let components fire interrupts
                 if (i < cycles - 1) {
                     ++i;
+                    if (cycles_left >= 1)
+                        cycles_left--;
+
                     core_timing.Tick();
                 }
             }
@@ -95,6 +397,8 @@ public:
                 } else {
                     --regs.repc;
                     --regs.pc;
+                    trace_file << ":rep_backwards" << std::setfill('0') << std::setw(8) << regs.pc
+                         << std::endl;
                 }
             }
 
@@ -105,6 +409,8 @@ public:
                 } else {
                     --regs.bkrep_stack[regs.bcn - 1].lc;
                     regs.pc = regs.bkrep_stack[regs.bcn - 1].start;
+                    trace_file << ":bkrep_stack" << std::setfill('0') << std::setw(8) << regs.pc
+                         << std::endl;
                 }
             }
 
@@ -120,6 +426,8 @@ public:
                         regs.ie = 0;
                         PushPC();
                         regs.pc = 0x0006 + i * 8;
+                        trace_file << ":interrupt" << std::setfill('0') << std::setw(8) << 0x0006 + i * 8
+                             << std::endl;
                         idle = false;
                         interrupt_handled = true;
                         if (regs.ic[i]) {
@@ -133,6 +441,8 @@ public:
                     regs.ie = 0;
                     PushPC();
                     regs.pc = vinterrupt_address;
+                    trace_file << ":vinterrupt" << std::setfill('0') << std::setw(8) << vinterrupt_address
+                         << std::endl;
                     idle = false;
                     if (vinterrupt_context_switch) {
                         ContextStore();
@@ -140,6 +450,10 @@ public:
                 }
             }
 
+            if (cycles_left >= 1)
+                cycles_left--;
+
+            trace_file << std::setfill('0') << std::setw(8) << regs.pc << std::endl;
             core_timing.Tick();
         }
     }
@@ -609,7 +923,7 @@ public:
             case RegName::a0:
             case RegName::a1:
                 UNREACHABLE();
-            // operation on accumulators doesn't go through regular bus with flag and saturation
+                // operation on accumulators doesn't go through regular bus with flag and saturation
             case RegName::a0l:
                 regs.a[0] = (regs.a[0] & 0xFFFF'FFFF'FFFF'0000) | result;
                 break;
@@ -1095,12 +1409,15 @@ public:
     void br(Address18_16 addr_low, Address18_2 addr_high, Cond cond) {
         if (regs.ConditionPass(cond)) {
             SetPC(Address32(addr_low, addr_high));
+            trace_file << ":br" << std::setfill('0') << std::setw(8) << Address32(addr_low, addr_high)
+                 << std::endl;
         }
     }
 
     void brr(RelAddr7 addr, Cond cond) {
         if (regs.ConditionPass(cond)) {
             regs.pc += addr.Relative32(); // note: pc is the address of the NEXT instruction
+            trace_file << ":brr" << std::setfill('0') << std::setw(8) << regs.pc << std::endl;
             if (addr.Relative32() == 0xFFFFFFFF) {
                 idle = true;
             }
@@ -1118,20 +1435,27 @@ public:
         if (regs.ConditionPass(cond)) {
             PushPC();
             SetPC(Address32(addr_low, addr_high));
+            trace_file << ":call" << std::setfill('0') << std::setw(8) << Address32(addr_low, addr_high)
+                 << std::endl;
         }
     }
     void calla(Axl a) {
         PushPC();
         SetPC(RegToBus16(a.GetName())); // use pcmhi?
+        trace_file << ":callaAxl" << std::setfill('0') << std::setw(8) << RegToBus16(a.GetName())
+             << std::endl;
     }
     void calla(Ax a) {
         PushPC();
         SetPC(GetAcc(a.GetName()) & 0x3FFFF); // no saturation ?
+        trace_file << ":callaAx" << std::setfill('0') << std::setw(8) << (GetAcc(a.GetName()) & 0x3FFFF)
+             << std::endl;
     }
     void callr(RelAddr7 addr, Cond cond) {
         if (regs.ConditionPass(cond)) {
             PushPC();
             regs.pc += addr.Relative32();
+            trace_file << ":callr" << std::setfill('0') << std::setw(8) << regs.pc << std::endl;
         }
     }
 
@@ -1176,6 +1500,7 @@ public:
     void ret(Cond c) {
         if (regs.ConditionPass(c)) {
             PopPC();
+            trace_file << ":ret" << std::setfill('0') << std::setw(8) << regs.pc << std::endl;
         }
     }
     void retd() {
@@ -1184,12 +1509,14 @@ public:
     void reti(Cond c) {
         if (regs.ConditionPass(c)) {
             PopPC();
+            trace_file << ":reti" << std::setfill('0') << std::setw(8) << regs.pc << std::endl;
             regs.ie = 1;
         }
     }
     void retic(Cond c) {
         if (regs.ConditionPass(c)) {
             PopPC();
+            trace_file << ":retic" << std::setfill('0') << std::setw(8) << regs.pc << std::endl;
             regs.ie = 1;
             ContextRestore();
         }
@@ -1202,6 +1529,7 @@ public:
     }
     void rets(Imm8 a) {
         PopPC();
+        trace_file << ":rets" << std::setfill('0') << std::setw(8) << regs.pc << std::endl;
         regs.sp += a.Unsigned16();
     }
 
@@ -1647,6 +1975,7 @@ public:
         u16 h = mem.ProgramRead(address);
         u16 l = mem.ProgramRead(address + 1);
         SetPC(l | ((u32)h << 16));
+        trace_file << ":movpdw" << std::setfill('0') << std::setw(8) << (l | ((u32)h << 16)) << std::endl;
     }
 
     void mov(Ab a, Ab b) {
@@ -2001,10 +2330,14 @@ public:
     void mov_pc(Ax a) {
         u64 value = GetAcc(a.GetName());
         SetPC(value & 0xFFFFFFFF);
+        trace_file << ":mov_pcAx" << std::setfill('0') << std::setw(8) << (value & 0xFFFFFFFF)
+             << std::endl;
     }
     void mov_pc(Bx a) {
         u64 value = GetAcc(a.GetName());
         SetPC(value & 0xFFFFFFFF);
+        trace_file << ":mov_pcBx" << std::setfill('0') << std::setw(8) << (value & 0xFFFFFFFF)
+             << std::endl;
     }
 
     void mov_mixp_to(Bx b) {
@@ -3455,8 +3788,8 @@ private:
         case StepValue::Decrease:
             s = 0xFFFF;
             break;
-        // TODO: Increase/Decrease2Mode1/2 sometimes have wrong result if Offset=+/-1.
-        // This however never happens with modr instruction.
+            // TODO: Increase/Decrease2Mode1/2 sometimes have wrong result if Offset=+/-1.
+            // This however never happens with modr instruction.
         case StepValue::Increase2Mode1:
             s = 2;
             step2_mode1 = !legacy;

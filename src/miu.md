@@ -4,6 +4,7 @@
 
 The following MMIO definition is extracted from Lauterbach's Teak debugger. Some of them are untested.
 ```
+                         0x0101                          0x0100
 +-----------#---+---+---+---#---+---+---+---#---+---+---+---#---+---+---+---#
 |+0x0100    |     Z3WS      |     Z2WS      |     Z1WS      |     Z0WS      |
 +-----------#---+---+---+---#---+---+---+---#---+---+---+---#---+---+---+---#
